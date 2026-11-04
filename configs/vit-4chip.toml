@@ -15,7 +15,7 @@ instance_type = "tputrial-v6e-worker"
 gpu_model = "Google TPU v6e (legacy config field)"
 gpu_count = 4
 node_count = 1
-network_description = "v6e 4x4 slice; 4 chips per host"
+network_description = "v6e 2x2 slice; 4 chips per host"
 storage_description = "cached inputs; worker-local boot disk"
 
 [billing]

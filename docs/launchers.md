@@ -17,6 +17,7 @@ All paths below are under `launchers/`. Training launchers share `src/tpu_benchm
 | `torchtpu-sdpa.sh` | DDP, 25 MiB bucket | On | Scaled dot-product attention |
 | `torchtpu-contiguous.sh` | DDP, 25 MiB bucket | On | Contiguous cached inputs |
 | `torchtpu-combined.sh` | DDP, 25 MiB bucket | On | Functional AdamW + handshake + SDPA + contiguous cached inputs |
+| `torchtpu-v6e-opt.sh` | Fused in-graph collectives | On | Fused collective FunctionalAdamW + zero-copy SDPA + async multi-step pipelining + in-place phase reset |
 | `rpe1-xla.sh` | Independent seed | XLA execution | RPE1 convergence |
 | `rpe1-torchtpu.sh` | Independent seed | On | RPE1 convergence |
 
