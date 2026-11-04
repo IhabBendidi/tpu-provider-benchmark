@@ -1,0 +1,7 @@
+{
+  "source_repository": "https://github.com/IhabBendidi/Cloud-GPU-Provider-Benchmark",
+  "source_commit": "a8607675ea780c95350b9439ad2b10b8d98339ba",
+  "source_path": "experiments/tpu",
+  "baseline_commit": "d5e2eab59f8ffabc1daecb81ccb8098b5cddc4b8",
+  "extraction": "TPU code, configurations, tests and immutable model dependencies only; no datasets, metrics, logs or model weights"
+}

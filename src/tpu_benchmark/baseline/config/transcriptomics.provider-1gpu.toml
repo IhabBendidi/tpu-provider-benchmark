@@ -1,0 +1,46 @@
+# Replace all provider/billing observations before collecting a real result.
+[run]
+run_id = "transcriptomics-1gpu"
+mode = "real_pipeline"
+seed = 20261005
+output_dir = "results"
+artifact_dir = "artifacts"
+artifact_max_bytes = 10737418240
+precision = "bf16"
+
+[provider]
+name = "provider-name"
+region = "eu-region"
+instance_type = "exact-h100-sxm-sku"
+gpu_model = "H100 SXM 80 GB"
+gpu_count = 1
+node_count = 1
+network_description = "record NIC and topology"
+storage_description = "record attached storage"
+
+[billing]
+currency = "EUR"
+configuration_hourly_cost = 0.0
+tax_included = false
+price_source = "provider price URL or invoice"
+observed_at_utc = "2026-10-06T00:00:00Z"
+
+[synthetic]
+profile = "provider_full"
+dataset_size = 100000
+validation_sample_count = 10000
+feature_count = 8192
+hidden_size = 4096
+latent_size = 64
+masking_rate = 0.15
+sparsity_rate = 0.60
+global_batch_size = 512
+micro_batch_size_per_rank = 32
+expected_world_size = 1
+num_workers = 8
+
+[timing]
+warmup_seconds = 600
+measurement_seconds = 1200
+measurement_repetitions = 3
+fixed_job_updates = 5000

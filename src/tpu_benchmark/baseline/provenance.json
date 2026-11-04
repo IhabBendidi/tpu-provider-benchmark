@@ -1,0 +1,21 @@
+{
+  "git_commit": "d5e2eab59f8ffabc1daecb81ccb8098b5cddc4b8",
+  "files": {
+    "src/gpu_pilot/__init__.py": "4debdaa0f68d7153d72dce001b6c8197614ccc5d3c8629a1edf02da3c20e10c4",
+    "src/gpu_pilot/config.py": "63222f453ec751a8f2bbac31f855741f7de4042728bcbffaa55b645cf6c8ac3e",
+    "src/gpu_pilot/contracts.py": "9054cdb24826fd54aa778ba13fa4b352b41c6a936bf9a35a20400d9df7277d1e",
+    "src/gpu_pilot/imaging.py": "3a662510f4c99043a38fa9feb854144665874c6f89b6d2f9716b95b286137723",
+    "src/gpu_pilot/results.py": "e4338d87a617b039e712371317700177933db4bc34f94781e5c20cf44c4b8384",
+    "src/gpu_pilot/rpe1_data.py": "d37386b258e27cd29314afab7cbd681dd829e35478a6bf3832fe64552b88eb46",
+    "src/gpu_pilot/rpe1_train.py": "fbb357c288e666ebd2bd9a8ab72bb0e0581a72727a059891aab1748320847b00",
+    "src/gpu_pilot/run.py": "ad32ab3a0abffaae658982230a5e8c0b66acac5d9b97fbc3bd7d1a14b6500068",
+    "src/gpu_pilot/scratch_expression.py": "7f8ff9baf0da56d268f5346045e9cdf9c3a45c6a9d8bc9f823803df8ddd8e4c2",
+    "src/gpu_pilot/synthetic.py": "4265ce5fa4f50d33b857816a4509d46daf341c69bf5d6f1ca0fb8daa9bc06666",
+    "src/gpu_pilot/telemetry.py": "63d9e4cd3aaa04ec85173557011b0e1901796bfe35ae9ebe3c21219b4b1aaf5f",
+    "src/gpu_pilot/zarr_stream.py": "f1ac3d2f34484c0b96ea9144bf07f1d118fce031c3a875f058b8b8f5cc85b2c4",
+    "config/benchmark.synthetic.local.toml": "c85c97af9a377a2193a1c2d0c81f4f51568bc79c9ece5105b1c95eb18c005790",
+    "config/imaging.synthetic.local.toml": "380a6a551f8a8398ed89f3642b3c9e3c1fae74be2e092088a9c38345ec721888",
+    "config/transcriptomics.provider-1gpu.toml": "c1311d26632839cf98a19a6be3bb33c6a9b1667cb0cf7bfd715d2dfc95d46fad"
+  },
+  "note": "Unmodified TPU model/data dependency closure; unrelated GPU, inference, transfer, S3 and Zarr runners omitted"
+}

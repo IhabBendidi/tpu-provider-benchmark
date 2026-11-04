@@ -1,0 +1,8 @@
+[Unit]
+Description=Collect standalone TPU benchmark results
+[Service]
+Type=oneshot
+WorkingDirectory=@REPOSITORY@
+ExecStart=@PYTHON@ @REPOSITORY@/src/tpu_benchmark/collect.py --receipt @RECEIPT@
+TimeoutStartSec=120
+UMask=0077

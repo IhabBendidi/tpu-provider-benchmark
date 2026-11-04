@@ -1,0 +1,10 @@
+[Unit]
+Description=Collect completed TPU benchmark jobs every two minutes
+
+[Timer]
+OnBootSec=30
+OnUnitInactiveSec=120
+Unit=tpu-results-collector.service
+
+[Install]
+WantedBy=timers.target

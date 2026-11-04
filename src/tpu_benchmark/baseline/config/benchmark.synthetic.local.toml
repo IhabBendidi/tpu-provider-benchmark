@@ -1,0 +1,45 @@
+[run]
+run_id = "local-smoke"
+workload = "synthetic_transcriptomics_mlp"
+mode = "real_pipeline"
+seed = 20261005
+output_dir = "results"
+artifact_dir = "artifacts"
+precision = "fp32"
+
+[provider]
+name = "local"
+region = "local"
+instance_type = "developer-machine"
+gpu_model = "record-if-present"
+gpu_count = 1
+node_count = 1
+network_description = "not applicable"
+storage_description = "local development storage"
+
+[billing]
+currency = "EUR"
+configuration_hourly_cost = 0.0
+tax_included = true
+price_source = "local development run"
+observed_at_utc = "2026-10-05T00:00:00Z"
+
+[synthetic]
+profile = "local_smoke"
+dataset_size = 1024
+validation_sample_count = 128
+feature_count = 256
+hidden_size = 128
+latent_size = 16
+masking_rate = 0.15
+sparsity_rate = 0.60
+global_batch_size = 32
+micro_batch_size_per_rank = 16
+expected_world_size = 1
+num_workers = 0
+
+[timing]
+warmup_seconds = 5
+measurement_seconds = 10
+measurement_repetitions = 3
+fixed_job_updates = 50

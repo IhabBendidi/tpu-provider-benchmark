@@ -1,0 +1,5 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.1+cpu
+torch-tpu==0.2.0
+libtpu==0.0.51
+-r common.txt
