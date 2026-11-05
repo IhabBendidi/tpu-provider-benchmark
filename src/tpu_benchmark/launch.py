@@ -22,6 +22,7 @@ VARIANTS = {
     "torchtpu-sdpa": ("torchtpu", "ddp", True, 25, "sdpa"),
     "torchtpu-contiguous": ("torchtpu", "ddp", True, 25, "contiguous"),
     "torchtpu-combined": ("torchtpu", "ddp", True, 25, "combined"),
+    "torchtpu-v6e-opt": ("torchtpu", "ddp", True, 100, "v6e_opt"),
 }
 
 
@@ -47,6 +48,30 @@ def plan(args, extra):
         "TORCH_TPU_DEFER_AND_FUSE": "1" if fusion else "0",
         "TORCH_TPU_SPMD_HANDSHAKE_STAGE": "OFF",
     }
+    if backend == "torchtpu" and args.nnodes == 1 and args.nproc_per_node == 4:
+        environment["TPU_PROCESS_BOUNDS"] = os.environ.get("TPU_PROCESS_BOUNDS", "2,2,1")
+        environment["TORCH_TPU_TOPOLOGY"] = os.environ.get("TORCH_TPU_TOPOLOGY", "2,2,1")
+        environment["TORCH_TPU_DEVICES_PER_HOST"] = os.environ.get(
+            "TORCH_TPU_DEVICES_PER_HOST", "4"
+        )
+        environment["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = os.environ.get(
+            "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+            "localhost:8471,localhost:8472,localhost:8473,localhost:8474",
+        )
+    if optimization == "v6e_opt":
+        environment["TORCH_TPU_DEFER_AND_FUSE_MAX_OPS"] = os.environ.get(
+            "TORCH_TPU_DEFER_AND_FUSE_MAX_OPS", "500"
+        )
+        environment["XLA_PERSISTENT_CACHE_PATH"] = os.environ.get(
+            "XLA_PERSISTENT_CACHE_PATH", "/tmp/tpu-xla-cache"
+        )
+        for tcmalloc in (
+            "/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4",
+            "/lib64/libtcmalloc.so.4",
+        ):
+            if Path(tcmalloc).is_file() and "LD_PRELOAD" not in os.environ:
+                environment["LD_PRELOAD"] = tcmalloc
+                break
     if backend == "xla":
         environment["PJRT_DEVICE"] = "TPU"
     if args.task == "rpe1":

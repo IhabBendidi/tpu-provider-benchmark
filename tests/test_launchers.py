@@ -116,3 +116,62 @@ def test_full_launcher_keeps_full_schedule():
         check=True,
     )
     assert "--preflight" not in json.loads(r.stdout)["command"]
+
+
+def test_v6e_opt_launcher_sets_2x2_topology_and_ddp_bucket100():
+    r = subprocess.run(
+        [
+            str(ROOT / "launchers/torchtpu-v6e-opt.sh"),
+            "--dry-run",
+            "--config",
+            "configs/vit-4chip.toml",
+            "--initial-state",
+            "/tmp/vit-4chip-initial.npz",
+            "--output",
+            "/tmp/vit-torchtpu-smoke",
+            "--nproc-per-node",
+            "4",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    plan = json.loads(r.stdout)
+    env, cmd = plan["environment"], plan["command"]
+    assert plan["variant"] == "torchtpu-v6e-opt"
+    assert env["TORCH_TPU_DEFER_AND_FUSE"] == "1"
+    assert env["TORCH_TPU_DEFER_AND_FUSE_MAX_OPS"] == "500"
+    assert env["TORCH_TPU_SPMD_HANDSHAKE_STAGE"] == "OFF"
+    assert env["TPU_PROCESS_BOUNDS"] == "2,2,1"
+    assert env["TORCH_TPU_TOPOLOGY"] == "2,2,1"
+    assert "localhost:8471,localhost:8472,localhost:8473,localhost:8474" in env[
+        "TORCH_TPU_SLICEBUILDER_ADDRESSES"
+    ]
+    assert "XLA_PERSISTENT_CACHE_PATH" in env
+    assert cmd[cmd.index("--bucket-mb") + 1] == "100"
+
+
+def test_launcher_forwards_xprof_option():
+    r = subprocess.run(
+        [
+            str(ROOT / "launchers/torchtpu-v6e-opt.sh"),
+            "--dry-run",
+            "--config",
+            "configs/vit-4chip.toml",
+            "--initial-state",
+            "/tmp/vit-4chip-initial.npz",
+            "--output",
+            "/tmp/vit-torchtpu-smoke",
+            "--nproc-per-node",
+            "4",
+            "--xprof=/tmp/xprof-trace",
+            "--xprof-steps",
+            "3",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    cmd = json.loads(r.stdout)["command"]
+    assert "--xprof=/tmp/xprof-trace" in cmd
+    assert cmd[cmd.index("--xprof-steps") + 1] == "3"

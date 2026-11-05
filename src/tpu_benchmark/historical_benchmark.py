@@ -12,7 +12,7 @@ import math
 import os
 import socket
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -40,7 +40,7 @@ def original_loader(config, backend, validation=False):
     return (expression_loader if config.synthetic else image_loader)(config, context, validation)
 
 
-def validation(model, config, backend, rng_state):
+def validation(model, config, backend, rng_state, sync_each_batch=True):
     # The cached GPU loop consumes no CPU random numbers after its first batch.
     # Restore that state so compiler/runtime internals cannot alter validation order.
     torch.set_rng_state(rng_state)
@@ -63,8 +63,11 @@ def validation(model, config, backend, rng_state):
                     weight = batch[1].numel()
             numerator += error
             denominator += weight
-            backend.sync()
+            if sync_each_batch:
+                backend.sync()
             count += 1
+    if not sync_each_batch:
+        backend.sync()
     numerator = backend.reduce(numerator)
     denominator = backend.reduce(denominator)
     backend.sync()
@@ -78,14 +81,133 @@ def validation(model, config, backend, rng_state):
     }
 
 
-def run_phase(args, config, backend, phase, seconds=None, updates=None):
+@contextmanager
+def trace_scope(name, backend):
+    if backend.name == "xla":
+        import torch_xla.debug.profiler as xp
+
+        with xp.Trace(name):
+            yield
+    else:
+        with torch.profiler.record_function(name):
+            yield
+
+
+def capture_xprof(
+    args,
+    config,
+    backend,
+    phase,
+    function,
+    model,
+    optimizer,
+    cached,
+    accumulation,
+    variant,
+    capture_collectives,
+    reduce_gradients,
+    runner=None,
+    flat_cached_inputs=None,
+):
+    xprof_dir = getattr(args, "xprof", None)
+    if xprof_dir is None:
+        return
+    steps = getattr(args, "xprof_steps", 5)
+    trace_dir = Path(xprof_dir) / f"rank{backend.rank}"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    model.train()
+    backend.sync()
+
+    def traced_step():
+        if variant == "v6e_opt":
+            with trace_scope("whole_step", backend):
+                _ = runner.step(*flat_cached_inputs)
+        else:
+            with trace_scope("zero_grad", backend):
+                optimizer.zero_grad(set_to_none=True)
+            for micro in range(accumulation):
+                batch = tuple(value.to(backend.device, non_blocking=True) for value in cached)
+                if variant in ("contiguous", "combined"):
+                    batch = tuple(value.contiguous() for value in batch)
+                context = (
+                    function.no_sync()
+                    if args.communication == "ddp"
+                    and not capture_collectives
+                    and micro < accumulation - 1
+                    else nullcontext()
+                )
+                with context:
+                    with trace_scope(f"microbatch_{micro}_forward", backend):
+                        with backend.autocast(config.run.precision):
+                            loss = function(*batch)
+                    with trace_scope(f"microbatch_{micro}_backward", backend):
+                        (loss / accumulation).backward()
+                backend.microstep()
+                with trace_scope(f"microbatch_{micro}_host_loss", backend):
+                    _ = float(loss.detach().cpu())
+            with trace_scope("optimizer_step", backend):
+                if reduce_gradients is not None:
+                    parameters = list(model.parameters())
+                    gradients = reduce_gradients([p.grad for p in parameters])
+                    for parameter, gradient in zip(parameters, gradients, strict=True):
+                        parameter.grad = gradient
+                    optimizer.step()
+                else:
+                    backend.optimizer_step(optimizer, args.communication)
+            with trace_scope("step_sync", backend):
+                backend.sync()
+
+    if backend.name == "xla":
+        import torch_xla.debug.profiler as xp
+
+        xp.start_trace(str(trace_dir))
+        try:
+            for _ in range(steps):
+                traced_step()
+            if variant == "v6e_opt":
+                backend.sync()
+        finally:
+            xp.stop_trace()
+    elif backend.name == "torchtpu":
+        from torch.tpu.profiler import TpuProfilerConfig
+
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.TPU,
+            ],
+            experimental_config=TpuProfilerConfig(
+                run_dir=trace_dir, worker_rank=str(backend.rank)
+            ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(str(trace_dir)),
+        ) as prof:
+            for _ in range(steps):
+                traced_step()
+                prof.step()
+            if variant == "v6e_opt":
+                backend.sync()
+    else:
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(str(trace_dir)),
+        ) as prof:
+            for _ in range(steps):
+                traced_step()
+                prof.step()
+            if variant == "v6e_opt":
+                backend.sync()
+    backend.sync()
+    emit(backend, "xprof_saved", phase=phase, path=str(xprof_dir), steps=steps)
+
+
+def run_phase(args, config, backend, phase, seconds=None, updates=None, capture_trace=False):
     settings = config.synthetic or config.imaging
     accumulation = settings.gradient_accumulation_steps(backend.world_size)
     model = make_model(config)
     with np.load(args.initial_state, allow_pickle=False) as data:
         model.load_state_dict({key: torch.from_numpy(data[key].copy()) for key in data.files})
     variant = getattr(args, "optimization", "baseline")
-    if variant in ("sdpa", "combined"):
+    if variant in ("sdpa", "combined") or (variant == "v6e_opt" and config.imaging is not None):
         from vit_optimizations import apply_attention
 
         apply_attention(model)
@@ -99,18 +221,25 @@ def run_phase(args, config, backend, phase, seconds=None, updates=None):
     validation_rng = torch.get_rng_state()
     function = model
     if backend.name == "torchtpu":
-        if variant in ("collective_handshake", "combined"):
-            os.environ["TORCH_TPU_SPMD_HANDSHAKE_STAGE"] = "COMPILE_STAGE"
-        function = torch.compile(model, backend="tpu", fullgraph=True)
+        os.environ["TORCH_TPU_SPMD_HANDSHAKE_STAGE"] = (
+            "COMPILE_STAGE"
+            if variant in ("collective_handshake", "combined", "v6e_opt")
+            else "OFF"
+        )
+        if variant != "v6e_opt":
+            function = torch.compile(model, backend="tpu", fullgraph=True)
     capture_collectives = variant in ("collective_handshake", "combined")
-    if args.communication == "ddp" and not capture_collectives:
+    if args.communication == "ddp":
         if backend.name != "torchtpu" or backend.world_size == 1:
             raise ValueError("DDP requires distributed TorchTPU")
-        function = torch.nn.parallel.DistributedDataParallel(
-            function, bucket_cap_mb=getattr(args, "bucket_mb", 25), gradient_as_bucket_view=True
-        )
+        if not capture_collectives and variant != "v6e_opt":
+            function = torch.nn.parallel.DistributedDataParallel(
+                function,
+                bucket_cap_mb=getattr(args, "bucket_mb", 25),
+                gradient_as_bucket_view=(variant != "functional_adamw"),
+            )
     reduce_gradients = None
-    if capture_collectives:
+    if variant in ("collective_handshake", "combined"):
 
         def average_gradients(gradients):
             outputs = []
@@ -121,21 +250,54 @@ def run_phase(args, config, backend, phase, seconds=None, updates=None):
             return outputs
 
         reduce_gradients = torch.compile(average_gradients, backend="tpu", fullgraph=True)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=settings.learning_rate if config.imaging else 0.001,
-        weight_decay=settings.weight_decay if config.imaging else 0.01,
-        foreach=False,
-        fused=False,
-    )
-    if variant in ("functional_adamw", "combined"):
-        from vit_optimizations import FunctionalAdamW
+    lr = settings.learning_rate if config.imaging else 0.001
+    weight_decay = settings.weight_decay if config.imaging else 0.01
+    optimizer = None
+    runner = None
+    flat_cached_inputs = None
+    if variant == "v6e_opt":
+        from vit_optimizations import WholeStepRunner
 
-        optimizer = FunctionalAdamW(
-            model.parameters(), settings.learning_rate, settings.weight_decay
+        cached_microbatches = [
+            tuple(value.clone().to(backend.device) for value in first)
+            for _ in range(accumulation)
+        ]
+        flat_cached_inputs = tuple(
+            tensor for batch in cached_microbatches for tensor in batch
         )
-    elif variant == "compiled_adamw":
-        optimizer.step = torch.compile(optimizer.step, backend="tpu", fullgraph=False)
+        runner = WholeStepRunner(
+            model=model,
+            accumulation=accumulation,
+            lr=lr,
+            weight_decay=weight_decay,
+            precision=config.run.precision,
+            example_flat_inputs=flat_cached_inputs,
+            compile_step=(backend.name == "torchtpu"),
+            trace_fx=True,
+            world_size=backend.world_size,
+            reduce_grads=(args.communication == "ddp"),
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+            foreach=False,
+            fused=False,
+        )
+        if variant in ("functional_adamw", "combined"):
+            from vit_optimizations import FunctionalAdamW
+
+            optimizer = FunctionalAdamW(
+                model.parameters(),
+                lr,
+                weight_decay,
+                compile_update=(backend.name == "torchtpu"),
+                world_size=backend.world_size,
+                reduce_grads=False,
+            )
+        elif variant == "compiled_adamw":
+            optimizer.step = torch.compile(optimizer.step, backend="tpu", fullgraph=False)
     backend.sync()
     emit(
         backend,
@@ -150,60 +312,106 @@ def run_phase(args, config, backend, phase, seconds=None, updates=None):
     elapsed, count, last_log = 0.0, 0, 0.0
     step_times, waits = [], []
     first_loss, last_loss = None, None
-    while (seconds is not None and elapsed < seconds) or (updates is not None and count < updates):
-        tick = time.perf_counter()
-        optimizer.zero_grad(set_to_none=True)
-        wait, loss_value = 0.0, 0.0
-        for micro in range(accumulation):
-            data_started = time.perf_counter()
-            batch = tuple(value.to(backend.device, non_blocking=True) for value in cached)
-            if variant in ("contiguous", "combined"):
-                batch = tuple(value.contiguous() for value in batch)
-            wait += time.perf_counter() - data_started
-            context = (
-                function.no_sync()
-                if args.communication == "ddp"
-                and not capture_collectives
-                and micro < accumulation - 1
-                else nullcontext()
-            )
-            with context:
-                with backend.autocast(config.run.precision):
-                    loss = function(*batch)
-                (loss / accumulation).backward()
-            backend.microstep()
-            loss_value += float(loss.detach().cpu())
-        if reduce_gradients is not None:
-            parameters = list(model.parameters())
-            gradients = reduce_gradients([p.grad for p in parameters])
-            for parameter, gradient in zip(parameters, gradients, strict=True):
-                parameter.grad = gradient
-            optimizer.step()
-        else:
-            backend.optimizer_step(optimizer, args.communication)
-        backend.sync()
-        # Preserve all three separate collectives from the historical runner.
-        step_times.append(backend.max_seconds(time.perf_counter() - tick))
-        waits.append(backend.max_seconds(wait))
-        count += 1
-        elapsed = backend.max_seconds(time.perf_counter() - started)
-        last_loss = loss_value / accumulation
-        if not math.isfinite(last_loss):
-            raise RuntimeError("Nonfinite training loss")
-        if first_loss is None:
-            first_loss = last_loss
-        if count == 1 or elapsed - last_log >= 5:
-            emit(
-                backend,
-                "progress",
-                phase=phase,
-                optimizer_updates=count,
-                elapsed_seconds=elapsed,
-                throughput_samples_per_second=count * settings.global_batch_size / elapsed,
-                training_loss=last_loss,
-            )
-            last_log = elapsed
-    validated = validation(model, config, backend, validation_rng)
+    if variant == "v6e_opt":
+        sync_interval = max(1, int(os.environ.get("TORCH_TPU_SYNC_INTERVAL", "6")))
+        while (seconds is not None and elapsed < seconds) or (
+            updates is not None and count < updates
+        ):
+            if count == 0:
+                burst_target = 1
+            elif updates is not None:
+                burst_target = min(sync_interval, updates - count)
+            else:
+                burst_target = sync_interval
+            tick = time.perf_counter()
+            last_loss_tensor = None
+            for _ in range(burst_target):
+                last_loss_tensor = runner.step(*flat_cached_inputs)
+            backend.sync()
+            now = time.perf_counter()
+            burst_elapsed = backend.max_seconds(now - tick)
+            total_elapsed = backend.max_seconds(now - started)
+            last_loss = float(last_loss_tensor.detach().cpu())
+            if not math.isfinite(last_loss):
+                raise RuntimeError("Nonfinite training loss")
+            if first_loss is None:
+                first_loss = last_loss
+            per_step_elapsed = burst_elapsed / burst_target
+            step_times.extend([per_step_elapsed] * burst_target)
+            waits.extend([0.0] * burst_target)
+            count += burst_target
+            elapsed = total_elapsed
+            if count == 1 or elapsed - last_log >= 5:
+                emit(
+                    backend,
+                    "progress",
+                    phase=phase,
+                    optimizer_updates=count,
+                    elapsed_seconds=elapsed,
+                    throughput_samples_per_second=count * settings.global_batch_size / elapsed,
+                    training_loss=last_loss,
+                )
+                last_log = elapsed
+        runner.sync_model_parameters()
+    else:
+        while (seconds is not None and elapsed < seconds) or (
+            updates is not None and count < updates
+        ):
+            tick = time.perf_counter()
+            optimizer.zero_grad(set_to_none=True)
+            wait, loss_value = 0.0, 0.0
+            for micro in range(accumulation):
+                data_started = time.perf_counter()
+                batch = tuple(value.to(backend.device, non_blocking=True) for value in cached)
+                if variant in ("contiguous", "combined"):
+                    batch = tuple(value.contiguous() for value in batch)
+                wait += time.perf_counter() - data_started
+                context = (
+                    function.no_sync()
+                    if args.communication == "ddp"
+                    and not capture_collectives
+                    and micro < accumulation - 1
+                    else nullcontext()
+                )
+                with context:
+                    with backend.autocast(config.run.precision):
+                        loss = function(*batch)
+                    (loss / accumulation).backward()
+                backend.microstep()
+                loss_value += float(loss.detach().cpu())
+            if reduce_gradients is not None:
+                parameters = list(model.parameters())
+                gradients = reduce_gradients([p.grad for p in parameters])
+                for parameter, gradient in zip(parameters, gradients, strict=True):
+                    parameter.grad = gradient
+                optimizer.step()
+            else:
+                backend.optimizer_step(optimizer, args.communication)
+            backend.sync()
+            # Preserve all three separate collectives from the historical runner.
+            step_times.append(backend.max_seconds(time.perf_counter() - tick))
+            waits.append(backend.max_seconds(wait))
+            count += 1
+            elapsed = backend.max_seconds(time.perf_counter() - started)
+            last_loss = loss_value / accumulation
+            if not math.isfinite(last_loss):
+                raise RuntimeError("Nonfinite training loss")
+            if first_loss is None:
+                first_loss = last_loss
+            if count == 1 or elapsed - last_log >= 5:
+                emit(
+                    backend,
+                    "progress",
+                    phase=phase,
+                    optimizer_updates=count,
+                    elapsed_seconds=elapsed,
+                    throughput_samples_per_second=count * settings.global_batch_size / elapsed,
+                    training_loss=last_loss,
+                )
+                last_log = elapsed
+    validated = validation(
+        model, config, backend, validation_rng, sync_each_batch=(variant != "v6e_opt")
+    )
     if not math.isfinite(validated["loss"]):
         raise RuntimeError("Nonfinite validation loss")
     ordered = sorted(step_times)
@@ -224,6 +432,23 @@ def run_phase(args, config, backend, phase, seconds=None, updates=None):
         "first_cpu_batch_sha256": input_hash,
     }
     emit(backend, "phase_complete", **result)
+    if capture_trace:
+        capture_xprof(
+            args,
+            config,
+            backend,
+            phase,
+            function,
+            model,
+            optimizer,
+            cached,
+            accumulation,
+            variant,
+            capture_collectives,
+            reduce_gradients,
+            runner=runner,
+            flat_cached_inputs=flat_cached_inputs,
+        )
     return result
 
 
@@ -286,8 +511,18 @@ def run(args):
                 "No checkpoint/export or GPU telemetry overhead comparison; training throughput and fixed-update validation only.",
             ],
         }
-        for phase, seconds, updates in schedule:
-            record["phases"].append(run_phase(args, config, backend, phase, seconds, updates))
+        for phase_idx, (phase, seconds, updates) in enumerate(schedule):
+            record["phases"].append(
+                run_phase(
+                    args,
+                    config,
+                    backend,
+                    phase,
+                    seconds,
+                    updates,
+                    capture_trace=(getattr(args, "xprof", None) is not None and phase_idx == 0),
+                )
+            )
             temporary = output.with_suffix(".partial")
             temporary.write_text(json.dumps(record, indent=2, allow_nan=False) + "\n")
         record["status"] = "completed"
@@ -322,7 +557,19 @@ def main():
             "sdpa",
             "contiguous",
             "combined",
+            "v6e_opt",
         ),
+    )
+    parser.add_argument(
+        "--xprof",
+        type=Path,
+        help="Directory to write XProf / torch.profiler traces of hot training steps",
+    )
+    parser.add_argument(
+        "--xprof-steps",
+        type=int,
+        default=5,
+        help="Number of hot steady-state training steps to record when --xprof is set",
     )
     parser.add_argument("--xla-spawn", action="store_true")
     args = parser.parse_args()
