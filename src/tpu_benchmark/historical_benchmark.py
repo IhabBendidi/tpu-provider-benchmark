@@ -106,6 +106,8 @@ def capture_xprof(
     variant,
     capture_collectives,
     reduce_gradients,
+    runner=None,
+    flat_cached_inputs=None,
 ):
     xprof_dir = getattr(args, "xprof", None)
     if xprof_dir is None:
@@ -117,27 +119,12 @@ def capture_xprof(
     backend.sync()
 
     def traced_step():
-        with trace_scope("zero_grad", backend):
-            optimizer.zero_grad(set_to_none=True)
         if variant == "v6e_opt":
-            micro_losses = []
-            for micro in range(accumulation):
-                with trace_scope(f"microbatch_{micro}_forward", backend):
-                    with backend.autocast(config.run.precision):
-                        loss = function(*cached)
-                with trace_scope(f"microbatch_{micro}_backward", backend):
-                    loss.backward()
-                backend.microstep()
-                micro_losses.append(loss.detach())
-            with trace_scope("optimizer_step", backend):
-                backend.optimizer_step(optimizer, args.communication)
-            with trace_scope("step_sync_and_loss", backend):
-                step_loss = micro_losses[0].float()
-                for extra_loss in micro_losses[1:]:
-                    step_loss = step_loss + extra_loss.float()
-                backend.sync()
-                _ = float(step_loss.cpu())
+            with trace_scope("whole_step", backend):
+                _ = runner.step(*flat_cached_inputs)
         else:
+            with trace_scope("zero_grad", backend):
+                optimizer.zero_grad(set_to_none=True)
             for micro in range(accumulation):
                 batch = tuple(value.to(backend.device, non_blocking=True) for value in cached)
                 if variant in ("contiguous", "combined"):
@@ -177,6 +164,8 @@ def capture_xprof(
         try:
             for _ in range(steps):
                 traced_step()
+            if variant == "v6e_opt":
+                backend.sync()
         finally:
             xp.stop_trace()
     elif backend.name == "torchtpu":
@@ -195,6 +184,8 @@ def capture_xprof(
             for _ in range(steps):
                 traced_step()
                 prof.step()
+            if variant == "v6e_opt":
+                backend.sync()
     else:
         with torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU],
@@ -203,6 +194,8 @@ def capture_xprof(
             for _ in range(steps):
                 traced_step()
                 prof.step()
+            if variant == "v6e_opt":
+                backend.sync()
     backend.sync()
     emit(backend, "xprof_saved", phase=phase, path=str(xprof_dir), steps=steps)
 
@@ -218,13 +211,6 @@ def run_phase(args, config, backend, phase, seconds=None, updates=None, capture_
         from vit_optimizations import apply_attention
 
         apply_attention(model)
-    if variant == "v6e_opt" and accumulation > 1:
-        orig_forward = model.forward
-
-        def scaled_forward(*batch):
-            return orig_forward(*batch) * (1.0 / accumulation)
-
-        model.forward = scaled_forward
     initial_hash = tensor_hash(model.state_dict().items())
     torch.set_rng_state(torch.from_numpy(np.load(args.initial_state.with_suffix(".rng.npy"))))
     model.to(backend.device).train()
@@ -235,9 +221,13 @@ def run_phase(args, config, backend, phase, seconds=None, updates=None, capture_
     validation_rng = torch.get_rng_state()
     function = model
     if backend.name == "torchtpu":
-        if variant in ("collective_handshake", "combined"):
-            os.environ["TORCH_TPU_SPMD_HANDSHAKE_STAGE"] = "COMPILE_STAGE"
-        function = torch.compile(model, backend="tpu", fullgraph=True)
+        os.environ["TORCH_TPU_SPMD_HANDSHAKE_STAGE"] = (
+            "COMPILE_STAGE"
+            if variant in ("collective_handshake", "combined", "v6e_opt")
+            else "OFF"
+        )
+        if variant != "v6e_opt":
+            function = torch.compile(model, backend="tpu", fullgraph=True)
     capture_collectives = variant in ("collective_handshake", "combined")
     if args.communication == "ddp":
         if backend.name != "torchtpu" or backend.world_size == 1:
@@ -262,26 +252,52 @@ def run_phase(args, config, backend, phase, seconds=None, updates=None, capture_
         reduce_gradients = torch.compile(average_gradients, backend="tpu", fullgraph=True)
     lr = settings.learning_rate if config.imaging else 0.001
     weight_decay = settings.weight_decay if config.imaging else 0.01
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=lr,
-        weight_decay=weight_decay,
-        foreach=False,
-        fused=False,
-    )
-    if variant in ("functional_adamw", "combined", "v6e_opt"):
-        from vit_optimizations import FunctionalAdamW
+    optimizer = None
+    runner = None
+    flat_cached_inputs = None
+    if variant == "v6e_opt":
+        from vit_optimizations import WholeStepRunner
 
-        optimizer = FunctionalAdamW(
-            model.parameters(),
-            lr,
-            weight_decay,
-            compile_update=(backend.name == "torchtpu"),
-            world_size=backend.world_size,
-            reduce_grads=(variant == "v6e_opt" and args.communication == "ddp"),
+        cached_microbatches = [
+            tuple(value.clone().to(backend.device) for value in first)
+            for _ in range(accumulation)
+        ]
+        flat_cached_inputs = tuple(
+            tensor for batch in cached_microbatches for tensor in batch
         )
-    elif variant == "compiled_adamw":
-        optimizer.step = torch.compile(optimizer.step, backend="tpu", fullgraph=False)
+        runner = WholeStepRunner(
+            model=model,
+            accumulation=accumulation,
+            lr=lr,
+            weight_decay=weight_decay,
+            precision=config.run.precision,
+            example_flat_inputs=flat_cached_inputs,
+            compile_step=(backend.name == "torchtpu"),
+            trace_fx=True,
+            world_size=backend.world_size,
+            reduce_grads=(args.communication == "ddp"),
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+            foreach=False,
+            fused=False,
+        )
+        if variant in ("functional_adamw", "combined"):
+            from vit_optimizations import FunctionalAdamW
+
+            optimizer = FunctionalAdamW(
+                model.parameters(),
+                lr,
+                weight_decay,
+                compile_update=(backend.name == "torchtpu"),
+                world_size=backend.world_size,
+                reduce_grads=False,
+            )
+        elif variant == "compiled_adamw":
+            optimizer.step = torch.compile(optimizer.step, backend="tpu", fullgraph=False)
     backend.sync()
     emit(
         backend,
@@ -297,43 +313,33 @@ def run_phase(args, config, backend, phase, seconds=None, updates=None, capture_
     step_times, waits = [], []
     first_loss, last_loss = None, None
     if variant == "v6e_opt":
+        sync_interval = max(1, int(os.environ.get("TORCH_TPU_SYNC_INTERVAL", "6")))
         while (seconds is not None and elapsed < seconds) or (
             updates is not None and count < updates
         ):
+            if count == 0:
+                burst_target = 1
+            elif updates is not None:
+                burst_target = min(sync_interval, updates - count)
+            else:
+                burst_target = sync_interval
             tick = time.perf_counter()
-            optimizer.zero_grad(set_to_none=True)
-            micro_losses = []
-            for micro in range(accumulation):
-                with backend.autocast(config.run.precision):
-                    loss = function(*cached)
-                loss.backward()
-                backend.microstep()
-                micro_losses.append(loss.detach())
-            backend.optimizer_step(optimizer, args.communication)
-            step_loss = micro_losses[0].float()
-            for extra_loss in micro_losses[1:]:
-                step_loss = step_loss + extra_loss.float()
+            last_loss_tensor = None
+            for _ in range(burst_target):
+                last_loss_tensor = runner.step(*flat_cached_inputs)
             backend.sync()
             now = time.perf_counter()
-            step_elapsed = now - tick
-            total_elapsed = now - started
-            if backend.world_size > 1:
-                timing_vec = torch.tensor(
-                    [step_elapsed, total_elapsed],
-                    device=backend.device,
-                    dtype=torch.float32,
-                )
-                backend.reduce(timing_vec, "max")
-                backend.sync()
-                step_elapsed, total_elapsed = timing_vec.cpu().tolist()
-            last_loss = float(step_loss.cpu())
+            burst_elapsed = backend.max_seconds(now - tick)
+            total_elapsed = backend.max_seconds(now - started)
+            last_loss = float(last_loss_tensor.detach().cpu())
             if not math.isfinite(last_loss):
                 raise RuntimeError("Nonfinite training loss")
             if first_loss is None:
                 first_loss = last_loss
-            step_times.append(step_elapsed)
-            waits.append(0.0)
-            count += 1
+            per_step_elapsed = burst_elapsed / burst_target
+            step_times.extend([per_step_elapsed] * burst_target)
+            waits.extend([0.0] * burst_target)
+            count += burst_target
             elapsed = total_elapsed
             if count == 1 or elapsed - last_log >= 5:
                 emit(
@@ -346,6 +352,7 @@ def run_phase(args, config, backend, phase, seconds=None, updates=None, capture_
                     training_loss=last_loss,
                 )
                 last_log = elapsed
+        runner.sync_model_parameters()
     else:
         while (seconds is not None and elapsed < seconds) or (
             updates is not None and count < updates
@@ -439,6 +446,8 @@ def run_phase(args, config, backend, phase, seconds=None, updates=None, capture_
             variant,
             capture_collectives,
             reduce_gradients,
+            runner=runner,
+            flat_cached_inputs=flat_cached_inputs,
         )
     return result
 
