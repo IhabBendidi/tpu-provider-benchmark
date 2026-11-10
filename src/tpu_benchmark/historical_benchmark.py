@@ -132,10 +132,17 @@ def run_phase(args, config, backend, phase, seconds=None, updates=None):
         from vit_optimizations import FunctionalAdamW
 
         optimizer = FunctionalAdamW(
-            model.parameters(), settings.learning_rate, settings.weight_decay
+            model.parameters(),
+            settings.learning_rate,
+            settings.weight_decay,
+            world_size=backend.world_size,
         )
     elif variant == "compiled_adamw":
         optimizer.step = torch.compile(optimizer.step, backend="tpu", fullgraph=False)
+    if variant in ("contiguous", "combined"):
+        cached = tuple(value.contiguous() for value in cached)
+    parameters = list(model.parameters())
+    grad_one = torch.ones((), device=backend.device, dtype=torch.float32)
     backend.sync()
     emit(
         backend,
@@ -146,48 +153,84 @@ def run_phase(args, config, backend, phase, seconds=None, updates=None):
         initial_state_sha256=initial_hash,
         first_cpu_batch_sha256=input_hash,
     )
+    timing_cpu = torch.empty(3, dtype=torch.float32)
+    timing_vec = torch.empty(3, device=backend.device, dtype=torch.float32)
+    for p in parameters:
+        p.grad = None
     started = time.perf_counter()
     elapsed, count, last_log = 0.0, 0, 0.0
     step_times, waits = [], []
     first_loss, last_loss = None, None
     while (seconds is not None and elapsed < seconds) or (updates is not None and count < updates):
         tick = time.perf_counter()
-        optimizer.zero_grad(set_to_none=True)
-        wait, loss_value = 0.0, 0.0
-        for micro in range(accumulation):
-            data_started = time.perf_counter()
-            batch = tuple(value.to(backend.device, non_blocking=True) for value in cached)
-            if variant in ("contiguous", "combined"):
-                batch = tuple(value.contiguous() for value in batch)
-            wait += time.perf_counter() - data_started
-            context = (
-                function.no_sync()
-                if args.communication == "ddp"
-                and not capture_collectives
-                and micro < accumulation - 1
-                else nullcontext()
-            )
-            with context:
-                with backend.autocast(config.run.precision):
+        if variant == "combined":
+            wait = 0.0
+            micro_gradients, micro_losses = [], []
+            with backend.autocast(config.run.precision):
+                for micro in range(accumulation):
+                    data_started = time.perf_counter()
+                    batch = cached
+                    wait += time.perf_counter() - data_started
+                    if micro > 0:
+                        for p in parameters:
+                            p.grad = None
                     loss = function(*batch)
-                (loss / accumulation).backward()
-            backend.microstep()
-            loss_value += float(loss.detach().cpu())
-        if reduce_gradients is not None:
-            parameters = list(model.parameters())
-            gradients = reduce_gradients([p.grad for p in parameters])
-            for parameter, gradient in zip(parameters, gradients, strict=True):
-                parameter.grad = gradient
-            optimizer.step()
+                    loss.backward(grad_one)
+                    micro_gradients.append([p.grad for p in parameters])
+                    micro_losses.append(loss.detach())
+            mean_loss_tensor = optimizer.step_accumulated(micro_gradients, micro_losses)
+            for p in parameters:
+                p.grad = None
+            del micro_gradients, micro_losses
+            backend.sync()
+            now = time.perf_counter()
+            timing_cpu[0] = now - tick
+            timing_cpu[1] = wait
+            timing_cpu[2] = now - started
+            timing_vec.copy_(timing_cpu)
+            backend.reduce(timing_vec, "max")
+            last_loss = float(mean_loss_tensor.cpu())
+            backend.sync()
+            step_t, wait_t, elapsed = timing_vec.cpu().tolist()
+            step_times.append(step_t)
+            waits.append(wait_t)
+            count += 1
         else:
-            backend.optimizer_step(optimizer, args.communication)
-        backend.sync()
-        # Preserve all three separate collectives from the historical runner.
-        step_times.append(backend.max_seconds(time.perf_counter() - tick))
-        waits.append(backend.max_seconds(wait))
-        count += 1
-        elapsed = backend.max_seconds(time.perf_counter() - started)
-        last_loss = loss_value / accumulation
+            optimizer.zero_grad(set_to_none=True)
+            wait, loss_value = 0.0, 0.0
+            for micro in range(accumulation):
+                data_started = time.perf_counter()
+                batch = tuple(value.to(backend.device, non_blocking=True) for value in cached)
+                if variant in ("contiguous", "combined"):
+                    batch = tuple(value.contiguous() for value in batch)
+                wait += time.perf_counter() - data_started
+                context = (
+                    function.no_sync()
+                    if args.communication == "ddp"
+                    and not capture_collectives
+                    and micro < accumulation - 1
+                    else nullcontext()
+                )
+                with context:
+                    with backend.autocast(config.run.precision):
+                        loss = function(*batch)
+                    (loss / accumulation).backward()
+                backend.microstep()
+                loss_value += float(loss.detach().cpu())
+            if reduce_gradients is not None:
+                gradients = reduce_gradients([p.grad for p in parameters])
+                for parameter, gradient in zip(parameters, gradients, strict=True):
+                    parameter.grad = gradient
+                optimizer.step()
+            else:
+                backend.optimizer_step(optimizer, args.communication)
+            backend.sync()
+            # Preserve all three separate collectives from the historical runner.
+            step_times.append(backend.max_seconds(time.perf_counter() - tick))
+            waits.append(backend.max_seconds(wait))
+            count += 1
+            elapsed = backend.max_seconds(time.perf_counter() - started)
+            last_loss = loss_value / accumulation
         if not math.isfinite(last_loss):
             raise RuntimeError("Nonfinite training loss")
         if first_loss is None:
